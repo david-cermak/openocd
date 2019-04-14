@@ -54,7 +54,9 @@ static int bcm2835gpio_write(int tck, int tms, int tdi);
 static int bcm2835gpio_reset(int trst, int srst);
 
 static int bcm2835_swdio_read(void);
+static int bcm2835_swdio_read_static_direction(void);
 static void bcm2835_swdio_drive(bool is_output);
+static void bcm2835_swdio_drive_static_direction(bool is_output);
 
 static int bcm2835gpio_init(void);
 static int bcm2835gpio_quit(void);
@@ -85,6 +87,12 @@ static int swclk_gpio = -1;
 static int swclk_gpio_mode;
 static int swdio_gpio = -1;
 static int swdio_gpio_mode;
+static int swdio_gpio_dir = -1;
+static int swdio_gpio_dir_mode;
+static int swdio_gpio_in = -1;
+static int swdio_gpio_in_mode;
+static int swdio_gpio_out = -1;
+static int swdio_gpio_out_mode;
 
 /* Transition delay coefficients */
 static int speed_coeff = 113714;
@@ -114,6 +122,20 @@ static int bcm2835gpio_swd_write(int tck, int tms, int tdi)
 {
 	uint32_t set = tck<<swclk_gpio | tdi<<swdio_gpio;
 	uint32_t clear = !tck<<swclk_gpio | !tdi<<swdio_gpio;
+
+	GPIO_SET = set;
+	GPIO_CLR = clear;
+
+	for (unsigned int i = 0; i < jtag_delay; i++)
+		asm volatile ("");
+
+	return ERROR_OK;
+}
+
+static int bcm2835gpio_swd_write_static_direction(int tck, int tms, int tdi)
+{
+	uint32_t set = tck<<swclk_gpio | tdi<<swdio_gpio_out;
+	uint32_t clear = !tck<<swclk_gpio | !tdi<<swdio_gpio_out;
 
 	GPIO_SET = set;
 	GPIO_CLR = clear;
@@ -154,9 +176,24 @@ static void bcm2835_swdio_drive(bool is_output)
 		INP_GPIO(swdio_gpio);
 }
 
+static void bcm2835_swdio_drive_static_direction(bool is_output)
+{
+	uint32_t set = is_output<<swdio_gpio_dir;
+	uint32_t clear = !is_output<<swdio_gpio_dir;
+
+	GPIO_SET = set;
+	GPIO_CLR = clear;
+
+	// delay will be applied afterwards on bcm2835gpio_swd_write
+}
+
 static int bcm2835_swdio_read(void)
 {
 	return !!(GPIO_LEV & 1 << swdio_gpio);
+}
+static int bcm2835_swdio_read_static_direction(void)
+{
+	return !!(GPIO_LEV & 1 << swdio_gpio_in);
 }
 
 static int bcm2835gpio_khz(int khz, int *jtag_speed)
@@ -294,6 +331,20 @@ COMMAND_HANDLER(bcm2835gpio_handle_swd_gpionum_swdio)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(bcm2835gpio_handle_swd_gpionums_swdio_single_dir)
+{
+	if (CMD_ARGC == 3) {
+		COMMAND_PARSE_NUMBER(int, CMD_ARGV[0], swdio_gpio_dir);
+		COMMAND_PARSE_NUMBER(int, CMD_ARGV[1], swdio_gpio_in);
+		COMMAND_PARSE_NUMBER(int, CMD_ARGV[2], swdio_gpio_out);
+	}
+
+	command_print(CMD_CTX, "BCM2835 num: swdio_dir = %d", swdio_gpio_dir);
+	command_print(CMD_CTX, "BCM2835 num: swdio_in  = %d", swdio_gpio_in);
+	command_print(CMD_CTX, "BCM2835 num: swdio_out = %d", swdio_gpio_out);
+	return ERROR_OK;
+}
+
 COMMAND_HANDLER(bcm2835gpio_handle_speed_coeffs)
 {
 	if (CMD_ARGC == 2) {
@@ -372,6 +423,13 @@ static const struct command_registration bcm2835gpio_command_handlers[] = {
 		.mode = COMMAND_CONFIG,
 		.help = "gpio number for swdio.",
 		.usage = "[swdio]",
+	},
+	{
+		.name = "bcm2835gpio_swdio_ios_single_dir",
+		.handler = &bcm2835gpio_handle_swd_gpionums_swdio_single_dir,
+		.mode = COMMAND_CONFIG,
+		.help = "gpio numbers for swdio with levelshifters: swdio_dir, swdio_in swdio_out (in that order)",
+		.usage = "[swdio_dir swdio_in swdio_out]",
 	},
 	{
 		.name = "bcm2835gpio_srst_num",
@@ -495,20 +553,38 @@ static int bcm2835gpio_init(void)
 	tms_gpio_mode = MODE_GPIO(tms_gpio);
 	swclk_gpio_mode = MODE_GPIO(swclk_gpio);
 	swdio_gpio_mode = MODE_GPIO(swdio_gpio);
+	swdio_gpio_dir_mode = MODE_GPIO(swdio_gpio_dir);
+	swdio_gpio_in_mode = MODE_GPIO(swdio_gpio_in);
+	swdio_gpio_out_mode = MODE_GPIO(swdio_gpio_out);
 	/*
 	 * Configure TDO as an input, and TDI, TCK, TMS, TRST, SRST
 	 * as outputs.  Drive TDI and TCK low, and TMS/TRST/SRST high.
+	 * Drive
 	 */
 	INP_GPIO(tdo_gpio);
-
-	GPIO_CLR = 1<<tdi_gpio | 1<<tck_gpio | 1<<swdio_gpio | 1<<swclk_gpio;
+	if (swdio_gpio != -1) {
+		GPIO_CLR = 1<<tdi_gpio | 1<<tck_gpio | 1<<swdio_gpio | 1<<swclk_gpio;
+	} else if (swdio_gpio_dir != -1 && swdio_gpio_out !=-1 && swdio_gpio_in != -1) {
+		// swdio single direction mode: drive high out and dir (to set swdio high)
+		GPIO_CLR = 1<<tdi_gpio | 1<<tck_gpio | 1<<swdio_gpio_out | 1<<swdio_gpio_dir | 1<<swclk_gpio;
+	}
 	GPIO_SET = 1<<tms_gpio;
 
 	OUT_GPIO(tdi_gpio);
 	OUT_GPIO(tck_gpio);
 	OUT_GPIO(tms_gpio);
 	OUT_GPIO(swclk_gpio);
-	OUT_GPIO(swdio_gpio);
+	if (swdio_gpio != -1) {
+		OUT_GPIO(swdio_gpio);
+	} else if (swdio_gpio_dir != -1 && swdio_gpio_out !=-1 && swdio_gpio_in != -1) {
+		OUT_GPIO(swdio_gpio_dir);
+		OUT_GPIO(swdio_gpio_out);
+		INP_GPIO(swdio_gpio_in);
+	} else {
+		LOG_ERROR("Error in SWD initialization: swdio must be configured either as bidirectional gpio or as two separate gpios with direction control (another gpio)");
+		return ERROR_JTAG_INIT_FAILED;
+	}
+
 	if (trst_gpio != -1) {
 		trst_gpio_mode = MODE_GPIO(trst_gpio);
 		GPIO_SET = 1 << trst_gpio;
@@ -526,6 +602,11 @@ static int bcm2835gpio_init(void)
 
 	if (swd_mode) {
 		bcm2835gpio_bitbang.write = bcm2835gpio_swd_write;
+		if (swdio_gpio_dir != -1 && swdio_gpio_out !=-1 && swdio_gpio_in != -1)	{
+			bcm2835gpio_bitbang.swdio_read = bcm2835_swdio_read_static_direction;
+			bcm2835gpio_bitbang.swdio_drive = bcm2835_swdio_drive_static_direction;
+			bcm2835gpio_bitbang.write = bcm2835gpio_swd_write_static_direction;
+		}
 		bitbang_switch_to_swd();
 	}
 
@@ -539,7 +620,13 @@ static int bcm2835gpio_quit(void)
 	SET_MODE_GPIO(tck_gpio, tck_gpio_mode);
 	SET_MODE_GPIO(tms_gpio, tms_gpio_mode);
 	SET_MODE_GPIO(swclk_gpio, swclk_gpio_mode);
-	SET_MODE_GPIO(swdio_gpio, swdio_gpio_mode);
+	if (swdio_gpio != -1) {
+		SET_MODE_GPIO(swdio_gpio, swdio_gpio_mode);
+	} else if (swdio_gpio_dir != -1 && swdio_gpio_out !=-1 && swdio_gpio_in != -1) {
+		SET_MODE_GPIO(swdio_gpio_dir, swdio_gpio_dir_mode);
+		SET_MODE_GPIO(swdio_gpio_in, swdio_gpio_in_mode);
+		SET_MODE_GPIO(swdio_gpio_out, swdio_gpio_out_mode);
+	}
 	if (trst_gpio != -1)
 		SET_MODE_GPIO(trst_gpio, trst_gpio_mode);
 	if (srst_gpio != -1)
